@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: calendar-assistant
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: ICLOUD_USERNAME
+        sync: false
+      - key: ICLOUD_APP_PASSWORD
+        sync: false
+      - key: ICLOUD_CALENDAR
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: CLAUDE_MODEL
+        value: claude-opus-5-5
+      - key: SETTINGS_KEY
+        generateValue: true
+      - key: TZ
+        value: America/New_York
+      - key: DEFAULT_REMINDER_COUNT
+        value: "3"
+      - key: DEFAULT_LEAD_MINUTES
+        value: "120"
+      - key: DATA_DIR
+        value: /opt/render/project/src/data
