@@ -17,6 +17,7 @@ from .tools import ToolContext, ToolError
 log = logging.getLogger(__name__)
 
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+BINDING_BETA = "thinking-binding-controls-2026-08-01"
 MAX_HISTORY_MESSAGES = 40
 MAX_TOOL_ITERATIONS = 12
 
@@ -135,15 +136,52 @@ def build_tools(ctx: ToolContext) -> list[Any]:
     return [list_events, create_event, update_event, delete_event, set_reminders, get_defaults, set_defaults]
 
 
+def _is_user_text(m: dict[str, Any]) -> bool:
+    """A real user turn (not a tool_result message)."""
+    if m.get("role") != "user":
+        return False
+    c = m.get("content")
+    if isinstance(c, str):
+        return True
+    return bool(c) and isinstance(c, list) and all(getattr(b, "type", None) == "text" or (isinstance(b, dict) and b.get("type") == "text") for b in c)
+
+
+def _strip_thinking(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove thinking blocks. Used only after a trim, when the retained turns are no
+    longer a verbatim prefix of the conversation that produced those blocks."""
+    out = []
+    for m in messages:
+        c = m.get("content")
+        if m.get("role") == "assistant" and isinstance(c, list):
+            kept = [b for b in c if getattr(b, "type", None) not in ("thinking", "redacted_thinking")]
+            out.append({"role": "assistant", "content": kept})
+        else:
+            out.append(m)
+    return out
+
+
 def _trim(messages: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    """Drop oldest turns, cutting only at a plain user text message so tool pairs stay intact."""
+    """Keep the tail of the history, cutting only at a user text turn so tool pairs stay
+    intact. The API binds a model's thinking blocks to the exact conversation prefix, so
+    anything we keep after a cut has its thinking blocks removed (allowed) rather than
+    replayed against a changed prefix (rejected)."""
     if len(messages) <= limit:
         return messages
     for i in range(len(messages) - limit, len(messages)):
-        m = messages[i]
-        if m["role"] == "user" and isinstance(m["content"], str):
-            return messages[i:]
-    return messages[-1:] if messages and isinstance(messages[-1].get("content"), str) else []
+        if _is_user_text(messages[i]):
+            return _strip_thinking(messages[i:])
+    # No user turn inside the window (one long tool round): keep the last full exchange.
+    for i in range(len(messages) - 1, -1, -1):
+        if _is_user_text(messages[i]):
+            return _strip_thinking(messages[i:])
+    return []
+
+
+def context_note(now: datetime, settings) -> str:
+    return (
+        f"[Context: now {now.astimezone(settings.tz).strftime('%A %Y-%m-%d %H:%M')} {settings.timezone}; "
+        f"defaults: {settings.reminder_count} reminder(s) per event, first one {settings.lead_minutes} min before.]"
+    )
 
 
 class Assistant:
@@ -155,37 +193,24 @@ class Assistant:
         self._history: dict[str, list[dict[str, Any]]] = {}
         self._lock = threading.Lock()
         self._fallbacks_ok = True
+        self._binding_ok = True
+        # Frozen for the life of the process: the API binds thinking blocks to the system
+        # prompt, so anything that changes per turn goes into the user message instead.
+        system = SYSTEM_STABLE
+        if ctx.settings_url:
+            system += f"\nSettings page (share it when the user wants to change defaults or see the dropdown): {ctx.settings_url}\n"
+        self._system = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
 
     def forget(self, chat_id: str) -> None:
         with self._lock:
             self._history.pop(chat_id, None)
 
-    def _system(self) -> list[dict[str, Any]]:
-        s = self._ctx.settings.load()
-        now: datetime = self._ctx.now()
-        volatile = (
-            f"Current date and time: {now.astimezone(s.tz).strftime('%A %Y-%m-%d %H:%M')} ({s.timezone}).\n"
-            f"Current defaults: {s.reminder_count} reminder(s) per event, first one {s.lead_minutes} minutes before.\n"
-            + (f"Settings page (share when the user asks to change defaults or see the dropdown): {self._ctx.settings_url}\n" if self._ctx.settings_url else "")
-        )
-        return [
-            {"type": "text", "text": SYSTEM_STABLE, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": volatile},
-        ]
-
     def reply(self, chat_id: str, text: str) -> str:
         with self._lock:
             messages = list(self._history.get(chat_id, []))
-        messages.append({"role": "user", "content": text})
-        try:
-            final, messages = self._run(messages)
-        except anthropic.BadRequestError as e:
-            if self._fallbacks_ok and "fallback" in str(e).lower():
-                log.warning("fallbacks not accepted, retrying without: %s", e)
-                self._fallbacks_ok = False
-                final, messages = self._run(messages)
-            else:
-                raise
+        note = context_note(self._ctx.now(), self._ctx.settings.load())
+        messages.append({"role": "user", "content": [{"type": "text", "text": note}, {"type": "text", "text": text}]})
+        final, messages = self._run_with_recovery(messages)
         with self._lock:
             self._history[chat_id] = _trim(messages, MAX_HISTORY_MESSAGES)
         if final is None:
@@ -195,15 +220,41 @@ class Assistant:
         reply = "\n".join(b.text for b in final.content if getattr(b, "type", "") == "text").strip()
         return reply or "Done."
 
+    def _run_with_recovery(self, messages: list[dict[str, Any]]):
+        start = list(messages)
+        for attempt in range(3):
+            try:
+                return self._run(list(start))
+            except anthropic.BadRequestError as e:
+                msg = str(e).lower()
+                if self._fallbacks_ok and "fallback" in msg:
+                    log.warning("fallbacks not accepted, retrying without: %s", e)
+                    self._fallbacks_ok = False
+                elif self._binding_ok and "block_binding" in msg:
+                    log.warning("block_binding not accepted, retrying without: %s", e)
+                    self._binding_ok = False
+                elif "thinking" in msg or "signature" in msg:
+                    log.warning("history rejected, retrying without old thinking blocks: %s", e)
+                    start = _strip_thinking(start)
+                else:
+                    raise
+        return self._run(list(start))
+
     def _run(self, messages: list[dict[str, Any]]):
         kwargs: dict[str, Any] = {}
+        betas: list[str] = []
         if self._fallbacks_ok:
-            kwargs["betas"] = [FALLBACK_BETA]
+            betas.append(FALLBACK_BETA)
             kwargs["fallbacks"] = "default"
+        if self._binding_ok:
+            betas.append(BINDING_BETA)
+            kwargs["thinking"] = {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}
+        if betas:
+            kwargs["betas"] = betas
         runner = self._client.beta.messages.tool_runner(
             model=self._config.claude_model,
             max_tokens=16000,
-            system=self._system(),
+            system=self._system,
             tools=self._tools,
             messages=messages,
             max_iterations=MAX_TOOL_ITERATIONS,
@@ -213,6 +264,9 @@ class Assistant:
         final = None
         for message in runner:
             final = message
+            dropped = [t for t in (getattr(message, "input_transformations", None) or []) if getattr(t, "type", "") == "thinking_dropped"]
+            if dropped:
+                log.warning("API dropped %d stale thinking block(s): %s", len(dropped), dropped[0])
             messages.append({"role": "assistant", "content": message.content})
             tool_response = runner.generate_tool_call_response()
             if tool_response is not None:
