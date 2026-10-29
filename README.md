@@ -35,7 +35,7 @@ A personal AI you text on Telegram. It keeps your Apple Calendar and texts you r
 Send `/start` to your bot in Telegram. The first chat to do that is paired and saved. To lock it permanently, copy the chat id from the Render logs into `TELEGRAM_CHAT_ID`.
 
 ### 6. Keep it awake (free)
-Render's free tier sleeps after 15 minutes without a request. Create a free account at <https://cron-job.org> and add a job that fetches `https://<your-service>.onrender.com/tick` **every 5 minutes**. Each hit also runs the reminder check, so reminders go out even if the service had just woken up.
+Render's free tier sleeps after 15 minutes without a request. The repo ships a GitHub Actions workflow (`.github/workflows/keepalive.yml`) that visits `/tick` every 5 minutes, which keeps the service awake and runs the reminder check. Edit the URL in that file to match your service. GitHub pauses scheduled workflows after 60 days with no commits; push any small change to resume it. Any other free pinger (cron-job.org, UptimeRobot) works the same way.
 
 ## Using it
 - Text the bot naturally. It answers in a line or two and confirms every change with the day, time and reminder plan.

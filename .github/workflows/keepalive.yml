@@ -1,0 +1,19 @@
+# Keeps the free Render service awake and runs the reminder check every 5 minutes.
+# GitHub may run scheduled jobs a few minutes late under load; the service's own
+# once-a-minute loop handles timing while it is awake, this just stops it napping.
+name: keep-awake
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Visit the reminder tick
+        run: |
+          curl --silent --show-error --max-time 90 --retry 2 \
+            https://calendar-assistant-ymxn.onrender.com/tick
